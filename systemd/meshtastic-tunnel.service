@@ -1,0 +1,16 @@
+# meshtastic-tunnel.service
+[Unit]
+Description=Meshtastic SSH Tunnel to Database
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/autossh -M 20000 -N -L 5432:localhost:5432 -i /root/.ssh/meshtastic_tunnel YOUR_DATABASE_USER@YOUR_DATABASE_HOST
+Restart=always
+RestartSec=10
+Environment="AUTOSSH_GATETIME=0"
+Environment="AUTOSSH_POLL=60"
+
+[Install]
+WantedBy=multi-user.target
