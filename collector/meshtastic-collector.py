@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Meshtastic Data Collector - Version 3.5 - Template
-Bridge Node Implementation for Mesh Network Monitoring
+Meshtastic Data Collector - Version 3.5 Final - Complete Fixed Version
+Sydney Bridge Node Implementation for NSW Mesh Network
+
+FIXED IN v3.5 Final:
+- Direct NODEINFO payload parsing (fixes temp node issue) ✅
+- Fixed bulk check node ID conversion (hex to int) ✅
+- Multiple payload format support ✅
+- Immediate database updates from NODEINFO packets ✅
+- Better debug logging for payload inspection ✅
 
 Features:
 - Real-time packet capture via LoRa interface
-- Direct NODEINFO payload parsing (fixes temp node issue)
 - Official Meshtastic portnum compliance
 - Intelligent node discovery and updates
 - Complete database schema compatibility  
@@ -13,8 +19,8 @@ Features:
 - Production-ready error handling and logging
 - Self-healing connections with auto-restart
 
-Database: TimescaleDB via SSH tunnel (optional)
-Device: Configurable USB device path
+Database: TimescaleDB via SSH tunnel
+Device: /dev/ttyACM0 (Meshtastic device)
 """
 
 import meshtastic.serial_interface
@@ -24,29 +30,16 @@ import time
 import logging
 import signal
 import sys
-import os
 from pubsub import pub
 
-# Import configuration
-try:
-    from config import (
-        DATABASE_CONFIG, DEVICE_CONFIG, LOGGING_CONFIG, 
-        BRIDGE_CONFIG, PERFORMANCE_CONFIG, FEATURES, ADVANCED_CONFIG
-    )
-except ImportError:
-    print("ERROR: config.py not found!")
-    print("Please copy config.example.py to config.py and update with your settings.")
-    sys.exit(1)
-
 # Configure logging
-log_handlers = [logging.StreamHandler()]
-if LOGGING_CONFIG.get('file_path'):
-    log_handlers.append(logging.FileHandler(LOGGING_CONFIG['file_path']))
-
 logging.basicConfig(
-    level=getattr(logging, LOGGING_CONFIG.get('level', 'INFO')),
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=log_handlers
+    handlers=[
+        logging.FileHandler('/var/log/meshtastic-collector.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -56,7 +49,7 @@ class MeshtasticCollector:
         self.interface = None
         self.db_conn = None
         self.pending_nodes = {}
-        self.last_node_check = {}
+        self.last_node_check = {}  # Track when we last checked each node
         self.stats = {
             'packets_received': 0,
             'packets_stored': 0,
@@ -68,23 +61,23 @@ class MeshtasticCollector:
             'start_time': datetime.now(timezone.utc)
         }
         
-        # Validate configuration
-        self._validate_config()
+        # Database configuration - UPDATE THESE VALUES
+        self.db_config = {
+            'host': 'localhost',        # SSH tunnel endpoint
+            'port': 5432,              # SSH tunnel port  
+            'database': 'meshtastic',  # UPDATE: Your database name
+            'user': 'postgres',        # UPDATE: Your database user
+            'password': 'p4ZwvXvkBBhlFcb1pOWRkDxbx'  # UPDATE: Your password
+        }
+        
+        # Device configuration
+        self.device_path = '/dev/ttyACM0'  # UPDATE: Your device path if different
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         pub.subscribe(self.on_receive, "meshtastic.receive")
         pub.subscribe(self.on_connection, "meshtastic.connection")
-        
-    def _validate_config(self):
-        """Validate configuration settings"""
-        if DATABASE_CONFIG['password'] == 'YOUR_DATABASE_PASSWORD_HERE':
-            logger.error("Please update DATABASE_CONFIG password in config.py")
-            sys.exit(1)
-            
-        if not os.path.exists(DEVICE_CONFIG['path']):
-            logger.warning(f"Device path {DEVICE_CONFIG['path']} not found - will retry on connect")
         
     def _signal_handler(self, signum, frame):
         logger.info("Shutdown signal received")
@@ -93,20 +86,17 @@ class MeshtasticCollector:
     def on_receive(self, packet, interface):
         try:
             self.stats['packets_received'] += 1
-            
-            if ADVANCED_CONFIG.get('debug_payload_parsing', False):
-                logger.debug(f"Raw packet: {packet}")
-                
             logger.info(f"Received packet from {packet.get('fromId', 'unknown')} "
                        f"to {packet.get('toId', 'unknown')} "
                        f"(SNR: {packet.get('rxSnr', 'N/A')}, RSSI: {packet.get('rxRssi', 'N/A')})")
             
-            # Process NODEINFO packets directly if feature enabled
+            # For NODEINFO packets, parse payload directly (NEW IN v3.5)
             decoded = packet.get('decoded', {})
-            if FEATURES.get('direct_nodeinfo_processing', True) and decoded.get('portnum') == 'NODEINFO_APP':
+            if decoded.get('portnum') == 'NODEINFO_APP':
                 from_id = packet.get('from')
                 if from_id:
                     self.stats['nodeinfo_triggers'] += 1
+                    # Parse NODEINFO payload directly instead of waiting for library
                     success = self.process_nodeinfo_payload(from_id, decoded)
                     if not success:
                         # Fallback to old method if direct parsing fails
@@ -119,18 +109,18 @@ class MeshtasticCollector:
             logger.error(f"Error in on_receive: {e}")
             
     def process_nodeinfo_payload(self, node_id, decoded):
-        """Process NODEINFO payload directly from packet"""
+        """NEW IN v3.5: Process NODEINFO payload directly from packet"""
         try:
+            # Check if there's a payload in the decoded data
             payload = decoded.get('payload')
             if not payload:
-                if ADVANCED_CONFIG.get('debug_payload_parsing', False):
-                    logger.debug(f"NODEINFO packet from {node_id} has no payload")
+                logger.debug(f"NODEINFO packet from {node_id} has no payload")
                 return False
             
-            if ADVANCED_CONFIG.get('debug_payload_parsing', False):
-                logger.debug(f"NODEINFO DEBUG - Node: {node_id}")
-                logger.debug(f"Payload type: {type(payload)}")
-                logger.debug(f"Decoded keys: {list(decoded.keys())}")
+            # Debug logging to understand payload format
+            logger.debug(f"NODEINFO DEBUG - Node: {node_id}")
+            logger.debug(f"Payload type: {type(payload)}")
+            logger.debug(f"Decoded keys: {list(decoded.keys())}")
             
             long_name = None
             short_name = None
@@ -142,13 +132,15 @@ class MeshtasticCollector:
                 long_name = payload.long_name
                 short_name = payload.short_name
                 if hasattr(payload, 'hw_model'):
-                    hw_model = str(payload.hw_model)
-                    
+                    hw_model = get_hardware_model_name(payload.hw_model)
+                logger.debug(f"Method 1 (protobuf attrs): {long_name} / {short_name}")
+                
             elif isinstance(payload, dict):
                 # Dictionary format
                 long_name = payload.get('long_name') or payload.get('longName')
                 short_name = payload.get('short_name') or payload.get('shortName') 
-                hw_model = payload.get('hw_model') or payload.get('hwModel', 'UNKNOWN')
+                hw_model = get_hardware_model_name(payload.get('hw_model') or payload.get('hwModel', 0))
+                logger.debug(f"Method 2 (dict): {long_name} / {short_name}")
                 
             else:
                 # Try to decode as User protobuf message
@@ -159,11 +151,14 @@ class MeshtasticCollector:
                         user_info.ParseFromString(payload)
                         long_name = user_info.long_name
                         short_name = user_info.short_name
-                        hw_model = str(user_info.hw_model) if user_info.hw_model else 'UNKNOWN'
+                        hw_model = get_hardware_model_name(user_info.hw_model) if user_info.hw_model else 'UNKNOWN'
+                        logger.debug(f"Method 3 (protobuf bytes): {long_name} / {short_name}")
                     else:
                         # Try string representation parsing as last resort
                         payload_str = str(payload)
+                        logger.debug(f"Method 4 attempt - payload string: {payload_str}")
                         
+                        # Look for patterns in string representation
                         if 'long_name:' in payload_str and 'short_name:' in payload_str:
                             import re
                             long_match = re.search(r'long_name:\s*"([^"]+)"', payload_str)
@@ -171,23 +166,25 @@ class MeshtasticCollector:
                             if long_match and short_match:
                                 long_name = long_match.group(1)
                                 short_name = short_match.group(1)
+                                logger.debug(f"Method 4 (regex): {long_name} / {short_name}")
                         
                         if not long_name:
-                            if ADVANCED_CONFIG.get('debug_payload_parsing', False):
-                                logger.debug(f"Unknown payload format for NODEINFO from {node_id}")
+                            logger.debug(f"Unknown payload format for NODEINFO from {node_id}: {type(payload)}")
+                            logger.debug(f"Payload content: {payload}")
                             return False
                             
                 except Exception as e:
-                    if ADVANCED_CONFIG.get('debug_payload_parsing', False):
-                        logger.debug(f"Failed to parse NODEINFO payload from {node_id}: {e}")
+                    logger.debug(f"Failed to parse NODEINFO payload from {node_id}: {e}")
                     return False
             
             # Validate we got real names
             if not long_name or not short_name:
+                logger.debug(f"NODEINFO from {node_id} missing names: long='{long_name}' short='{short_name}'")
                 return False
             
             # Don't update if we just got temporary names
             if long_name.startswith('Node-') or short_name.startswith('N'):
+                logger.debug(f"NODEINFO from {node_id} has temporary names, skipping")
                 return False
             
             # Update database immediately with real nodeinfo
@@ -205,15 +202,22 @@ class MeshtasticCollector:
                     hardware_model = EXCLUDED.hardware_model,
                     updated_at = EXCLUDED.updated_at
             """, (
-                str(node_id), short_name, long_name, hw_model, 'CLIENT', 'unknown',
-                None, None, None, None,
-                datetime.now(timezone.utc), datetime.now(timezone.utc)
+                str(node_id),
+                short_name,
+                long_name,
+                hw_model,
+                'CLIENT',  # Default role
+                'unknown',
+                None, None, None, None,  # Position fields
+                datetime.now(timezone.utc),
+                datetime.now(timezone.utc)
             ))
             
             logger.info(f"🎉 DIRECT NODEINFO UPDATE: {node_id} -> {long_name} ({short_name}) [{hw_model}]")
             self.stats['nodes_updated'] += 1
             self.stats['nodeinfo_direct_updates'] += 1
             
+            # Remove from pending nodes
             if node_id in self.pending_nodes:
                 del self.pending_nodes[node_id]
                 
@@ -221,30 +225,25 @@ class MeshtasticCollector:
                 
         except Exception as e:
             logger.error(f"Error processing NODEINFO payload for {node_id}: {e}")
+            logger.error(f"Payload type: {type(decoded.get('payload'))}")
+            logger.error(f"Decoded keys: {decoded.keys()}")
             return False
             
+    def on_connection(self, interface, topic=pub.AUTO_TOPIC):
+        logger.info(f"Connection event: {topic}")
+        
     def connect(self):
         try:
-            # Connect to database
-            self.db_conn = psycopg2.connect(**DATABASE_CONFIG)
+            self.db_conn = psycopg2.connect(**self.db_config)
             self.db_conn.autocommit = True
             logger.info("Database connected")
             
-            # Connect to Meshtastic device
-            device_path = DEVICE_CONFIG['path']
-            baud_rate = DEVICE_CONFIG.get('baud_rate')
-            
-            if baud_rate:
-                self.interface = meshtastic.serial_interface.SerialInterface(device_path, baud_rate)
-            else:
-                self.interface = meshtastic.serial_interface.SerialInterface(device_path)
-                
+            self.interface = meshtastic.serial_interface.SerialInterface(self.device_path)
             my_info = self.interface.getMyNodeInfo()
             logger.info(f"Meshtastic connected: {my_info.get('user', {}).get('longName', 'Unknown')}")
             
             self.ensure_node_exists(my_info.get('num'))
             return True
-            
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             return False
@@ -252,40 +251,52 @@ class MeshtasticCollector:
     def check_and_update_node(self, node_id):
         """Legacy method - kept as fallback for library-based updates"""
         try:
-            if not hasattr(self.interface, 'nodes') or node_id not in self.interface.nodes:
-                return False
+            if not hasattr(self.interface, 'nodes'):
+                return
                 
-            node_info = self.interface.nodes[node_id]
-            user = node_info.get('user', {})
-            long_name = user.get('longName')
-            short_name = user.get('shortName')
-            
-            if long_name and not long_name.startswith('Node-'):
-                cursor = self.db_conn.cursor()
-                cursor.execute("""
-                    UPDATE node_details 
-                    SET long_name = %s, short_name = %s, updated_at = %s
-                    WHERE node_id = %s AND long_name LIKE 'Node-%'
-                """, (
-                    long_name, short_name or f'N{str(node_id)[-4:]}',
-                    datetime.now(timezone.utc), str(node_id)
-                ))
+            # Check if we have this node in the interface
+            if node_id in self.interface.nodes:
+                node_info = self.interface.nodes[node_id]
+                user = node_info.get('user', {})
+                long_name = user.get('longName')
+                short_name = user.get('shortName')
                 
-                if cursor.rowcount > 0:
-                    logger.info(f"🔄 Updated node name via fallback: {node_id} -> {long_name}")
-                    self.stats['nodes_updated'] += 1
+                if long_name and not long_name.startswith('Node-'):
+                    # We have a real name! Update the database
+                    cursor = self.db_conn.cursor()
+                    cursor.execute("""
+                        UPDATE node_details 
+                        SET long_name = %s, short_name = %s, updated_at = %s
+                        WHERE node_id = %s AND long_name LIKE 'Node-%'
+                    """, (
+                        long_name,
+                        short_name or f'N{str(node_id)[-4:]}',
+                        datetime.now(timezone.utc),
+                        str(node_id)
+                    ))
                     
-                    if node_id in self.pending_nodes:
-                        del self.pending_nodes[node_id]
-                    return True
-                    
+                    if cursor.rowcount > 0:
+                        logger.info(f"🔄 Updated node name via fallback: {node_id} -> {long_name}")
+                        self.stats['nodes_updated'] += 1
+                        
+                        # Remove from pending list
+                        if node_id in self.pending_nodes:
+                            del self.pending_nodes[node_id]
+                        return True
+                    else:
+                        logger.debug(f"Node {node_id} already has proper name")
+                else:
+                    logger.debug(f"Node {node_id} in interface but no proper name: {long_name}")
+            else:
+                logger.debug(f"Node {node_id} not found in interface nodes")
+                
         except Exception as e:
             logger.error(f"Error checking node {node_id}: {e}")
             
         return False
             
     def ensure_node_exists(self, node_id):
-        """Create node entry if it doesn't exist"""
+        """Modified in v3.5: Less aggressive with temporary names"""
         if not node_id:
             return
             
@@ -298,20 +309,27 @@ class MeshtasticCollector:
             existing = cursor.fetchone()
             
             if existing:
+                # Node exists, don't overwrite with temporary name
+                logger.debug(f"Node {node_id_str} already exists: {existing[0]}")
                 return
             
-            # Get info from interface if available
+            # First check if we can get real info from interface
             node_info = {}
             if hasattr(self.interface, 'nodes') and node_id in self.interface.nodes:
                 node_info = self.interface.nodes[node_id]
             
             user = node_info.get('user', {})
             position = node_info.get('position', {})
-            long_name = user.get('longName') or f'Node-{node_id_str}'
-            short_name = user.get('shortName') or f'N{node_id_str[-4:]}'
+            long_name = user.get('longName')
+            short_name = user.get('shortName')
             
-            if long_name.startswith('Node-'):
+            # Only create with temporary name if we don't have real info
+            if not long_name or long_name.startswith('Node-'):
+                long_name = f'Node-{node_id_str}'
                 self.pending_nodes[node_id] = time.time()
+                
+            if not short_name or short_name.startswith('N'):
+                short_name = f'N{node_id_str[-4:]}'
             
             # Create new node
             cursor.execute("""
@@ -321,63 +339,77 @@ class MeshtasticCollector:
                     created_at, updated_at
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                node_id_str, short_name, long_name,
-                user.get('hwModel', 'UNKNOWN'), user.get('role', 'CLIENT'), 'unknown',
-                position.get('longitude'), position.get('latitude'), position.get('altitude'), None,
-                datetime.now(timezone.utc), datetime.now(timezone.utc)
+                node_id_str,
+                short_name,
+                long_name,
+                get_hardware_model_name(user.get('hwModel', 0)),
+                user.get('role', 'CLIENT'),
+                'unknown',
+                position.get('longitude'),
+                position.get('latitude'),
+                position.get('altitude'),
+                None,
+                datetime.now(timezone.utc),
+                datetime.now(timezone.utc)
             ))
             
-            status = "temporary" if long_name.startswith('Node-') else "real name"
-            logger.info(f"Created node: {node_id_str} ({long_name}) [{status}]")
-            self.stats['nodes_created'] += 1
+            if long_name.startswith('Node-'):
+                logger.info(f"Created temporary node: {node_id_str} (awaiting NODEINFO)")
+                self.stats['nodes_created'] += 1
+            else:
+                logger.info(f"Created node with real name: {node_id_str} ({long_name})")
+                self.stats['nodes_updated'] += 1
                 
         except psycopg2.IntegrityError:
-            pass  # Node already exists
+            # Node already exists, ignore
+            pass
         except Exception as e:
-            logger.error(f"Error creating node: {e}")
+            logger.error(f"Error creating/updating node: {e}")
             
     def bulk_check_nodes(self):
-        """Periodically check all nodes in interface for updates"""
-        if not FEATURES.get('bulk_node_checking', True):
-            return
-            
+        """FIXED: Periodically check all nodes in interface for updates"""
         if not hasattr(self.interface, 'nodes'):
             return
             
         updated_count = 0
         checked_count = 0
-        max_checks = PERFORMANCE_CONFIG.get('max_bulk_checks', 20)
         
+        # Check a subset of interface nodes each time
         for node_id_key, node_info in self.interface.nodes.items():
             checked_count += 1
-            if checked_count > max_checks:
+            if checked_count > 20:  # Limit to 20 checks per cycle
                 break
                 
             try:
                 # Convert hex node ID to integer for database lookup
                 if isinstance(node_id_key, str) and node_id_key.startswith('!'):
+                    # Remove ! prefix and convert hex to int
                     node_id = int(node_id_key[1:], 16)
                 elif isinstance(node_id_key, int):
                     node_id = node_id_key
                 else:
+                    logger.debug(f"Skipping bulk check for unknown node ID format: {node_id_key}")
                     continue
                 
                 user = node_info.get('user', {})
                 long_name = user.get('longName')
                 
                 if long_name and not long_name.startswith('Node-'):
+                    # Check if this node is still temporary in database
                     cursor = self.db_conn.cursor()
                     cursor.execute("""
                         UPDATE node_details 
                         SET long_name = %s, short_name = %s, updated_at = %s
                         WHERE node_id = %s AND long_name LIKE 'Node-%'
                     """, (
-                        long_name, user.get('shortName') or f'N{str(node_id)[-4:]}',
-                        datetime.now(timezone.utc), str(node_id)
+                        long_name,
+                        user.get('shortName') or f'N{str(node_id)[-4:]}',
+                        datetime.now(timezone.utc),
+                        str(node_id)
                     ))
                     
                     if cursor.rowcount > 0:
-                        logger.info(f"🔄 Updated node from bulk check: {node_id} -> {long_name}")
+                        logger.info(f"🔄 Updated node from bulk check: {node_id} ({node_id_key}) -> {long_name}")
                         self.stats['nodes_updated'] += 1
                         updated_count += 1
                         
@@ -391,7 +423,6 @@ class MeshtasticCollector:
             logger.info(f"Bulk check updated {updated_count} nodes from {checked_count} checked")
                     
     def process_packet(self, packet):
-        """Process and store packet data"""
         try:
             from_id = packet.get('from')
             to_id = packet.get('to')
@@ -399,19 +430,20 @@ class MeshtasticCollector:
             if not from_id:
                 return
                 
-            # Check packet size limit
-            packet_size = len(str(packet))
-            if packet_size > ADVANCED_CONFIG.get('packet_size_limit', 1024):
-                logger.warning(f"Packet size {packet_size} exceeds limit, skipping")
-                return
-                
             self.ensure_node_exists(from_id)
             if to_id and to_id != 4294967295:
                 self.ensure_node_exists(to_id)
                 
             decoded = packet.get('decoded', {})
+            rx_time = packet.get('rxTime', int(time.time()))
+            rx_snr = packet.get('rxSnr', 0.0)
+            rx_rssi = packet.get('rxRssi', 0)
+            hop_limit = packet.get('hopLimit', 0)
+            hop_start = packet.get('hopStart', 0)
+            want_ack = packet.get('wantAck', False)
+            via_mqtt = packet.get('viaMqtt', False)
+            packet_id = packet.get('id', 0)
             
-            # Calculate payload size
             payload_size = 0
             if 'payload' in decoded:
                 payload = decoded['payload']
@@ -421,13 +453,14 @@ class MeshtasticCollector:
                     payload_size = len(payload.encode('utf-8'))
             
             # Handle portnum according to official Meshtastic specification
+            # See: https://meshtastic.org/docs/development/firmware/portnum/
             portnum = decoded.get('portnum', 0)
             if portnum == 0:
-                portnum = 'UNKNOWN_APP'
+                portnum = 'UNKNOWN_APP'  # Official portnum 0 - unrecognized packets
             elif isinstance(portnum, int) and portnum >= 256:
-                portnum = 'PRIVATE_APP'
+                portnum = 'PRIVATE_APP'  # Custom applications (256-511 range)
+            # else: keep string values as-is (TELEMETRY_APP, NODEINFO_APP, etc.)
             
-            # Store packet metrics
             cursor = self.db_conn.cursor()
             cursor.execute("""
                 INSERT INTO mesh_packet_metrics (
@@ -438,24 +471,31 @@ class MeshtasticCollector:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """, (
-                datetime.fromtimestamp(packet.get('rxTime', time.time()), timezone.utc),
-                str(from_id), str(to_id) if to_id else None, portnum,
-                packet.get('id', 0), packet.get('channel', 0), packet.get('rxTime', int(time.time())),
-                packet.get('rxSnr', 0.0), packet.get('rxRssi', 0), packet.get('hopLimit', 0),
-                packet.get('hopStart', 0), packet.get('wantAck', False), 
-                packet.get('viaMqtt', False), payload_size
+                datetime.fromtimestamp(rx_time, timezone.utc),
+                str(from_id),
+                str(to_id) if to_id else None,
+                portnum,
+                packet_id,
+                packet.get('channel', 0),
+                rx_time,
+                rx_snr,
+                rx_rssi,
+                hop_limit,
+                hop_start,
+                want_ack,
+                via_mqtt,
+                payload_size
             ))
             
             self.stats['packets_stored'] += 1
             
-            # Get display name for logging
             display_name = f"Node-{from_id}"
             if hasattr(self.interface, 'nodes') and from_id in self.interface.nodes:
                 user = self.interface.nodes[from_id].get('user', {})
                 if user.get('longName'):
                     display_name = user.get('longName')
             
-            logger.info(f"Stored packet: {display_name} ({from_id}) -> {to_id}, "
+            logger.info(f"Stored packet: {display_name} ({str(from_id)}) -> {str(to_id)}, "
                        f"Type: {portnum}, Size: {payload_size}")
             
         except Exception as e:
@@ -463,7 +503,6 @@ class MeshtasticCollector:
             logger.error(f"Error processing packet: {e}")
             
     def print_stats(self):
-        """Print runtime statistics"""
         runtime = datetime.now(timezone.utc) - self.stats['start_time']
         logger.info(f"Stats - Runtime: {runtime}, "
                    f"Received: {self.stats['packets_received']}, "
@@ -476,10 +515,9 @@ class MeshtasticCollector:
                    f"Pending: {len(self.pending_nodes)}")
                    
     def run(self):
-        """Main collection loop"""
         logger.info("Starting Meshtastic data collection...")
-        logger.info("Version: 3.5 Final - Production Template")
-        logger.info(f"Bridge Node: {BRIDGE_CONFIG.get('node_name', 'Unknown')} - {BRIDGE_CONFIG.get('location', 'Unknown')}")
+        logger.info("Version: 3.5 Final - Complete Fixed Version")
+        logger.info("Bridge Node: Sydney (BNS1) - NSW Mesh Network")
         
         if not self.connect():
             return False
@@ -494,13 +532,12 @@ class MeshtasticCollector:
             while self.running:
                 time.sleep(1)
                 
-                # Bulk checks
-                if (time.time() - last_bulk_check > PERFORMANCE_CONFIG.get('bulk_check_interval', 60)):
+                # Do bulk node checks every 60 seconds
+                if time.time() - last_bulk_check > 60:
                     self.bulk_check_nodes()
                     last_bulk_check = time.time()
                 
-                # Stats reporting
-                if (time.time() - last_stats_time > PERFORMANCE_CONFIG.get('stats_interval', 60)):
+                if time.time() - last_stats_time > 60:
                     self.print_stats()
                     last_stats_time = time.time()
                     
@@ -514,7 +551,6 @@ class MeshtasticCollector:
         return True
         
     def cleanup(self):
-        """Clean up resources"""
         logger.info("Cleaning up resources...")
         
         if self.interface:
@@ -540,3 +576,37 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
+
+# Hardware model mapping dictionary
+HARDWARE_MODELS = {
+    0: "UNSET", 1: "TLORA_V2", 2: "TLORA_V1", 3: "TLORA_V2_1_1P6",
+    4: "TBEAM", 5: "HELTEC_UNSUPPORTED", 6: "TBEAM_V0P7", 7: "T_ECHO",
+    8: "TLORA_V1_1P3", 9: "RAK4631", 10: "HELTEC_V2_0", 11: "HELTEC_V2_1",
+    12: "HELTEC_V1", 13: "LILYGO_TBEAM_S3_CORE", 14: "RAK11200", 15: "NANO_G1",
+    16: "TLORA_V2_1_1P8", 17: "TLORA_T3_S3", 18: "NANO_G1_EXPLORER", 19: "NANO_G2_ULTRA",
+    20: "LORA_RELAY_V1", 21: "STATION_G1", 22: "RAK11310", 23: "SENSELORA_RP2040",
+    24: "SENSELORA_S3", 25: "CANARYONE", 26: "RP2040_LORA", 27: "STATION_G2",
+    28: "LORA_RELAY_V2", 29: "ENCODER", 30: "5GHOUL", 31: "HELTEC_V3",
+    32: "HELTEC_WSL_V3", 33: "BETAFPV_2400_TX", 34: "BETAFPV_900_NANO_TX", 35: "RPI_PICO",
+    36: "HELTEC_WIRELESS_TRACKER", 37: "HELTEC_WIRELESS_PAPER", 38: "T_DECK", 39: "T_WATCH_S3",
+    40: "PICOMPUTER_S3", 41: "HELTEC_HT62", 42: "EBYTE_ESP32_S3", 43: "ESP32_S3_PICO",
+    44: "CHATTER_2", 45: "HELTEC_WIRELESS_PAPER_V1_0", 46: "HELTEC_WIRELESS_TRACKER_V1_0", 47: "UNPHONE",
+    48: "TD_LORAC", 49: "CDEBYTE_EORA_S3", 50: "TWC_MESH_V4", 51: "NRF52_UNKNOWN",
+    52: "PORTDUINO", 53: "ANDROID_SIM", 54: "DIY_V1", 55: "NRF52840_PCA10059",
+    56: "DR_DEV", 57: "M5STACK", 58: "M5STACK_CORE2", 59: "M5STACK_M5STICKC",
+    60: "M5STACK_M5STICKC_PLUS", 61: "M5STACK_M5STICKC_PLUS2", 62: "M5STACK_M5ATOM", 63: "M5STACK_M5NANO",
+    64: "M5STACK_STAMP_S3", 65: "M5STACK_CORE_INK", 66: "M5STACK_PAPER", 67: "M5STACK_CORES3",
+    68: "M5STACK_CORE_BASIC", 69: "M5STACK_CORE_FIRE", 70: "M5STACK_CARDPUTER", 71: "SEEDSTUDIO_XIAO_S3",
+    72: "RADIOMASTER_900_BANDIT_NANO", 73: "HELTEC_CAPSULE_SENSOR_V3", 74: "HELTEC_VISION_MASTER_T190", 75: "HELTEC_VISION_MASTER_E213",
+    76: "HELTEC_VISION_MASTER_E290", 77: "HELTEC_MESH_NODE_T114", 78: "SENSECAP_INDICATOR", 79: "TRACKER_T1000_E",
+    80: "RAK3172", 81: "RAK11310_WISBLOCK", 82: "PRIVATE_HW", 83: "RAK4631_WISBLOCK", 255: "RESERVED"
+}
+
+def get_hardware_model_name(hardware_value):
+    """Convert hardware enum value to readable name"""
+    if isinstance(hardware_value, str):
+        try:
+            hardware_value = int(hardware_value)
+        except ValueError:
+            return hardware_value  # Already a string name
+    return HARDWARE_MODELS.get(hardware_value, f"UNKNOWN_HW_{hardware_value}")
