@@ -1,0 +1,17 @@
+# Meshtastic Bridge Collector Dependencies
+
+# Core Meshtastic library
+meshtastic>=2.0.0
+
+# Database connectivity
+psycopg2-binary>=2.9.0
+
+# Pub/sub messaging (included with meshtastic)
+pubsub>=0.1.2
+
+# Standard library imports (no additional packages needed)
+# - datetime, timezone
+# - time
+# - logging  
+# - signal
+# - sys
