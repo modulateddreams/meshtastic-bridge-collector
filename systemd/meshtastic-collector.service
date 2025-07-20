@@ -1,0 +1,17 @@
+# meshtastic-collector.service  
+[Unit]
+Description=Meshtastic Data Collector
+After=network.target meshtastic-tunnel.service
+Requires=meshtastic-tunnel.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meshtastic-bridge-collector
+Environment=PATH=/opt/meshtastic-bridge-collector/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/meshtastic-bridge-collector/venv/bin/python /opt/meshtastic-bridge-collector/collector/meshtastic-collector.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
