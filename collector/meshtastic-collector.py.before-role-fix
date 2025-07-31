@@ -96,13 +96,6 @@ class MeshtasticCollector:
             long_name = decoded_payload.get('longName', 'Unknown')
             short_name = decoded_payload.get('shortName', 'Unknown')
             hardware_model = decoded_payload.get('hw', 'Unknown')
-            role_value = decoded_payload.get('role', 0)  # Default to CLIENT (0)
-            
-            # Convert role number to name using our mapping function
-            if isinstance(role_value, int):
-                role = self.get_role_name(role_value)
-            else:
-                role = str(role_value) if role_value else 'CLIENT'
             
             # Convert hardware model number to name if needed
             if isinstance(hardware_model, int):
@@ -112,17 +105,16 @@ class MeshtasticCollector:
             
             # Use robust database connection with retry logic
             query = """
-            INSERT INTO node_details (node_id, long_name, short_name, hardware_model, role, created_at, last_seen)
-            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            INSERT INTO node_details (node_id, long_name, short_name, hardware_model, created_at, last_seen) 
+            VALUES (%s, %s, %s, %s, NOW(), NOW())
             ON CONFLICT (node_id) DO UPDATE SET
                 long_name = EXCLUDED.long_name,
                 short_name = EXCLUDED.short_name,
                 hardware_model = EXCLUDED.hardware_model,
-                role = EXCLUDED.role,
                 last_seen = NOW()
             """
             
-            success = self.db.execute_with_retry(query, (node_id, long_name, short_name, hardware_model, role))
+            success = self.db.execute_with_retry(query, (node_id, long_name, short_name, hardware_model))
             
             if success:
                 self.stats['nodes_updated'] += 1
@@ -256,23 +248,6 @@ class MeshtasticCollector:
             # Add more mappings as discovered
         }
         return hardware_map.get(hw_model, f"UNKNOWN_HW_{hw_model}")
-
-    def get_role_name(self, role_value):
-        """Convert device role enum value to human-readable name"""
-        role_mapping = {
-            0: "CLIENT", 1: "CLIENT_MUTE", 2: "ROUTER", 3: "ROUTER_CLIENT",
-            4: "REPEATER", 5: "TRACKER", 6: "SENSOR", 7: "TAK",
-            8: "CLIENT_HIDDEN", 9: "LOST_AND_FOUND", 10: "TAK_TRACKER", 11: "ROUTER_LATE"
-        }
-        if role_value is None:
-            return "CLIENT"
-        try:
-            role_int = int(role_value)
-        except (ValueError, TypeError):
-            if isinstance(role_value, str):
-                return role_value
-            return "CLIENT"
-        return role_mapping.get(role_int, f"UNKNOWN_ROLE_{role_int}")
 
     def print_stats(self):
         """Print statistics with robust connection health check"""
