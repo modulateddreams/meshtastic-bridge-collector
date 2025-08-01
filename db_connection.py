@@ -48,6 +48,10 @@ class RobustDBConnection:
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logging.warning(f"Connection attempt {attempt + 1} failed: {e}")
                 if attempt < self.max_retries - 1:
+                    # If pool is closed, try to recreate it
+                    if "connection pool is closed" in str(e):
+                        logging.info("Recreating connection pool due to closure")
+                        self.recreate_pool()
                     time.sleep(2 ** attempt)  # Exponential backoff
                     self.recreate_pool()
                 else:
@@ -83,6 +87,10 @@ class RobustDBConnection:
                     except:
                         pass
                 if attempt < self.max_retries - 1:
+                    # If pool is closed, try to recreate it
+                    if "connection pool is closed" in str(e):
+                        logging.info("Recreating connection pool due to closure")
+                        self.recreate_pool()
                     time.sleep(2 ** attempt)
                 else:
                     raise
