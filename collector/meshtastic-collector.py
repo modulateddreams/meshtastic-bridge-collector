@@ -1,3 +1,4 @@
+# Meshtastic Bridge Collector v1.3.2 - NODEINFO Bytes & Hex Parsing Hotfix
 #!/usr/bin/env python3
 """
 Meshtastic Data Collector - Version 3.6 - Database Resilience Update
@@ -93,6 +94,21 @@ class MeshtasticCollector:
         """Create or update node from NODEINFO payload with robust database connection"""
         try:
             # Extract node information from payload
+            # FIX v1.3.2: Handle bytes payload
+            if isinstance(decoded_payload, bytes):
+                logger.info(f"NODEINFO payload for {node_id} is bytes - creating minimal entry")
+                # Create minimal node entry
+                query = '''
+                INSERT INTO node_details (node_id, long_name, short_name, hardware_model, role, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (node_id) DO UPDATE SET updated_at = NOW()
+                '''
+                success = self.db.execute_with_retry(query, (node_id, f"Node {node_id}", f"N{str(node_id)[-4:]}", "UNKNOWN", "CLIENT"))
+                if success:
+                    self.stats['nodes_updated'] += 1
+                    logger.info(f"Created minimal entry for node {node_id}")
+                return success
+            
             long_name = decoded_payload.get('longName', 'Unknown')
             short_name = decoded_payload.get('shortName', 'Unknown')
             hardware_model = decoded_payload.get('hw', 'Unknown')
@@ -112,8 +128,8 @@ class MeshtasticCollector:
             
             # Use robust database connection with retry logic
             query = """
-            INSERT INTO node_details (node_id, long_name, short_name, hardware_model, role, created_at, last_seen)
-            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            INSERT INTO node_details (node_id, long_name, short_name, hardware_model, role, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT (node_id) DO UPDATE SET
                 long_name = EXCLUDED.long_name,
                 short_name = EXCLUDED.short_name,
@@ -199,8 +215,14 @@ class MeshtasticCollector:
             logger.info(f"Received packet from {from_node} to {to_node} (SNR: {packet.get('rxSnr', 'N/A')}, RSSI: {packet.get('rxRssi', 'N/A')})")
             
             # Convert node IDs to integers for database storage
-            source_id = int(from_node, 16) if isinstance(from_node, str) and from_node.startswith('!') else None
-            dest_id = int(to_node, 16) if isinstance(to_node, str) and to_node.startswith('!') else None
+            source_id = int(from_node.lstrip('!'), 16) if isinstance(from_node, str) and from_node.startswith('!') else None
+            # Handle broadcast and hex node IDs
+            if to_node == '^all':
+                dest_id = '4294967295'  # Broadcast address
+            elif isinstance(to_node, str) and to_node.startswith('!'):
+                dest_id = str(int(to_node.lstrip('!'), 16))
+            else:
+                dest_id = None
             
             if source_id is None:
                 logger.warning(f"Could not parse source node ID: {from_node}")
@@ -291,7 +313,7 @@ class MeshtasticCollector:
 
     def run(self):
         """Main run loop with improved error handling"""
-        logger.info("Starting Meshtastic Collector v3.6...")
+        logger.info("Starting Meshtastic Collector v1.3.2...")
         
         if not self.connect():
             logger.error("Failed to connect. Exiting.")
